@@ -34,6 +34,109 @@ POLLUTANT_CONFIG = {
     'NO2': (1, 30)
 }
 
+# WHO and Taiwan reference limits (simplified selection for 24h/8h where appropriate)
+STANDARDS = {
+    'PM2.5': {
+        'WHO2005_annual': 10,
+        'WHO2005_24h': 25,
+        'WHO2021_annual': 5,
+        'WHO2021_24h': 15,
+        'Taiwan_annual': 15,
+        'Taiwan_24h': 35
+    },
+    'PM10': {
+        'WHO2005_annual': 20,
+        'WHO2005_24h': 50,
+        'WHO2021_annual': 15,
+        'WHO2021_24h': 45,
+        'Taiwan_annual': 50,
+        'Taiwan_24h': 100
+    },
+    'O3': {
+        # use 8-hour guideline for comparison and Taiwan 1-day average as reference
+        'WHO2021_8h': 100,
+        'Taiwan_8h': 118,
+        'Taiwan_1day_peak': 236
+    },
+    'NO2': {
+        'WHO2021_1day': 25,
+        'WHO2005_annual': 40,
+        'Taiwan_1day': 188,
+        'Taiwan_annual': 56
+    },
+    'SO2': {
+        'WHO2021_1day': 40,
+        'WHO2005_1day': 20,
+        'Taiwan_1day': 197,
+        'Taiwan_annual': 52
+    },
+    'CO': {
+        'WHO2021_1day': 4,
+        'Taiwan_1day': None
+    }
+}
+
+# Susceptible groups and generic warnings
+SUSCEPTIBLE_GROUPS = {
+    'PM2.5': ['心血管疾病患者', '呼吸道疾病患者', '老人', '幼兒', '孕婦'],
+    'PM10': ['呼吸道疾病患者', '老人', '幼兒'],
+    'O3': ['呼吸道疾病患者', '運動者', '老人', '幼兒'],
+    'NO2': ['呼吸道疾病患者', '哮喘患者', '老人', '幼兒'],
+    'SO2': ['呼吸道疾病患者', '支氣管敏感者'],
+    'CO': ['心血管疾病患者', '慢性病患者']
+}
+
+def evaluate_against_standards(pollutant: str, value: float):
+    """Compare a predicted value against WHO/Taiwan reference values and produce warnings."""
+    res = {}
+    std = STANDARDS.get(pollutant, {})
+    if pollutant == 'PM2.5' or pollutant == 'PM10':
+        # use 24h comparison
+        who2021 = std.get('WHO2021_24h') or std.get('WHO2021_8h')
+        taiwan = std.get('Taiwan_24h')
+        res['WHO2021_24h'] = who2021
+        res['Taiwan_24h'] = taiwan
+        if who2021 is not None and value > who2021:
+            res['who_flag'] = True
+        else:
+            res['who_flag'] = False
+        if taiwan is not None and value > taiwan:
+            res['taiwan_flag'] = True
+        else:
+            res['taiwan_flag'] = False
+    elif pollutant == 'O3':
+        who = std.get('WHO2021_8h')
+        taiwan = std.get('Taiwan_8h')
+        res['WHO2021_8h'] = who
+        res['Taiwan_8h'] = taiwan
+        res['who_flag'] = (who is not None and value > who)
+        res['taiwan_flag'] = (taiwan is not None and value > taiwan)
+    elif pollutant in ('NO2', 'SO2', 'CO'):
+        # compare against 1-day (or hourly) reference where available
+        key_who = 'WHO2021_1day' if 'WHO2021_1day' in std else next(iter([k for k in std.keys() if '1day' in k or '24h' in k]), None)
+        who = std.get(key_who)
+        taiwan = std.get(next(iter([k for k in std.keys() if 'Taiwan' in k and ('1day' in k or '24h' in k)]), ''), None)
+        res['WHO_ref'] = who
+        res['Taiwan_ref'] = taiwan
+        res['who_flag'] = (who is not None and value > who)
+        res['taiwan_flag'] = (taiwan is not None and value > taiwan)
+    else:
+        res['who_flag'] = False
+        res['taiwan_flag'] = False
+
+    # build warning message
+    warnings = []
+    if res.get('who_flag'):
+        warnings.append('超過 WHO 建議值（需注意）')
+    if res.get('taiwan_flag'):
+        warnings.append('超過台灣標準（注意或採取行動）')
+    if warnings:
+        res['warning_text'] = '；'.join(warnings)
+    else:
+        res['warning_text'] = '符合主要參考標準'
+    # include susceptible groups
+    res['sensitive_groups'] = SUSCEPTIBLE_GROUPS.get(pollutant, [])
+    return res
 
 @st.cache_data
 def load_csv_data(filepath: str) -> pd.DataFrame:
@@ -476,6 +579,32 @@ def app():
                 st.write(f"預測日期: {pd.to_datetime(pred_time).strftime('%Y-%m-%d')}  預測小時: {pd.to_datetime(pred_time).strftime('%H:%M')}")
             except Exception:
                 st.write(f"預測時間: {pred_time}")
+
+            # Compare prediction against WHO / Taiwan standards and show warnings
+            try:
+                std_res = evaluate_against_standards(pollutant, pred)
+                st.markdown('**參考標準比較**')
+                if pollutant in ('PM2.5', 'PM10'):
+                    st.write(f"WHO (24h): {std_res.get('WHO2021_24h', 'N/A')} ； 台灣 (24h): {std_res.get('Taiwan_24h', 'N/A')}")
+                elif pollutant == 'O3':
+                    st.write(f"WHO (8h): {std_res.get('WHO2021_8h', 'N/A')} ； 台灣 (8h): {std_res.get('Taiwan_8h', 'N/A')}")
+                else:
+                    st.write(f"WHO 參考值: {std_res.get('WHO_ref', std_res.get('WHO2021_1day', 'N/A'))} ； 台灣 參考值: {std_res.get('Taiwan_ref', std_res.get('Taiwan_1day', 'N/A'))}")
+
+                # show susceptible groups
+                groups = std_res.get('sensitive_groups', [])
+                if groups:
+                    st.write('適用人群：' + '、'.join(groups))
+
+                # warning text
+                warn_txt = std_res.get('warning_text', '')
+                if warn_txt and warn_txt != '符合主要參考標準':
+                    st.warning(f"警告：{warn_txt} — 建議敏感族群盡量減少戶外活動或採取防護措施。")
+                else:
+                    st.info('目前預測值符合主要參考標準')
+            except Exception:
+                # non-critical: do not break prediction display
+                pass
             # plot: show last 100 hourly points (including possible NaNs) and predicted next-hour point
             series_full = transform_data(series, aqi_t)  # do not dropna here to show hourly points
             real_plot = series_full[-100:]
