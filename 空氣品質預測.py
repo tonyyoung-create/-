@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 import os
 import urllib3
@@ -53,9 +55,17 @@ def load_csv_data(filepath: str) -> pd.DataFrame:
         st.warning('CSV 欄位名稱找不到預期的 monitordate/itemengname/concentration，請確認檔案格式')
         return pd.DataFrame()
     df[date_col] = pd.to_datetime(df[date_col])
+    # 將時間向下取整到小時，確保每筆資料以小時為單位
+    df[date_col] = df[date_col].dt.floor('H')
     df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
     df_pivot = df.pivot_table(index=date_col, columns=item_col, values=value_col)
     df_pivot.sort_index(inplace=True)
+    # 重新索引成連續的每小時索引，缺值保留以供後續插值
+    try:
+        full_index = pd.date_range(start=df_pivot.index.min(), end=df_pivot.index.max(), freq='H')
+        df_pivot = df_pivot.reindex(full_index)
+    except Exception:
+        pass
     return df_pivot
 
 
@@ -95,9 +105,17 @@ def fetch_api_data() -> pd.DataFrame:
         # try alternative keys
         df = df.rename(columns={k: k.lower() for k in df.columns})
     df['monitordate'] = pd.to_datetime(df['monitordate'])
+    # floor to hour
+    df['monitordate'] = df['monitordate'].dt.floor('H')
     df['concentration'] = pd.to_numeric(df['concentration'], errors='coerce')
     df_pivot = df.pivot_table(index='monitordate', columns='itemengname', values='concentration')
     df_pivot.sort_index(inplace=True)
+    # reindex to hourly range to align with CSV data
+    try:
+        full_index = pd.date_range(start=df_pivot.index.min(), end=df_pivot.index.max(), freq='H')
+        df_pivot = df_pivot.reindex(full_index)
+    except Exception:
+        pass
     return df_pivot
 
 
@@ -206,31 +224,50 @@ def AQI_category(val, pollutant_idx):
         return 6
 
 
-def plot_series(x, real_vals, pred_vals, pollutant):
-    """Plot real and predicted values against the same x (datetime or numeric)."""
+def plot_series(real_vals, pred_vals, pollutant):
+    """Plot real and predicted values (real: pd.Series, pred: tuple or array)."""
     fig, ax = plt.subplots(figsize=(8, 3))
-        # real: pandas Series (indexed by timestamp)
-        # pred: tuple (pred_time, pred_value) or array of predicted values
-        if hasattr(real_vals, 'index'):
-            ax.plot(real_vals.index, real_vals.values, label='Real', color='red')
-        else:
-            ax.plot(real_vals, label='Real', color='red')
 
-        # If pred is a tuple (time, value), plot as a scatter point
-        if isinstance(pred_vals, tuple) and len(pred_vals) == 2:
-            pred_time, pred_val = pred_vals
-            try:
-                ax.scatter([pred_time], [pred_val], color='blue', label='Predicted (next)')
-            except Exception:
-                ax.plot([len(real_vals)], [pred_val], marker='o', color='blue', label='Predicted (next)')
-        else:
-            # pred is an array of values aligned after real (e.g., appended)
-            ax.plot(pred_vals, label='Predicted', color='blue')
+    # 畫實際值
+    if hasattr(real_vals, 'index'):
+        # plot line with small markers at each hourly point
+        ax.plot(
+            real_vals.index,
+            real_vals.values,
+            label='Real',
+            color='red',
+            marker='o',
+            markersize=3,
+            linestyle='-'
+        )
+    else:
+        ax.plot(real_vals, label='Real', color='red', marker='o', markersize=3, linestyle='-')
 
-        ax.set_title(f"{pollutant} Prediction")
-        ax.legend()
+    # 畫預測值
+    if isinstance(pred_vals, tuple) and len(pred_vals) == 2:
+        pred_time, pred_val = pred_vals
+        try:
+            ax.scatter([pred_time], [pred_val], color='blue', label='Predicted (next)')
+        except Exception:
+            ax.plot([len(real_vals)], [pred_val], marker='o', color='blue', label='Predicted (next)')
+    else:
+        ax.plot(pred_vals, label='Predicted', color='blue')
+
+    ax.set_title(f"{pollutant} Prediction")
+    ax.legend()
+
+    # 格式化 x 軸：主刻度每 12 小時，次刻度每 1 小時；主刻度顯示日期+小時
+    try:
+        import matplotlib.dates as mdates
+
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=12))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        ax.xaxis.set_minor_locator(mdates.HourLocator(interval=1))
         fig.autofmt_xdate()
-        st.pyplot(fig)
+    except Exception:
+        pass
+
+    st.pyplot(fig)
 
 
 def app():
@@ -290,11 +327,96 @@ def app():
                 scaled = scaler.fit_transform(series_t.values.reshape(-1, 1))
                 X, y = create_dataset(scaled.flatten(), look_back=n_steps)
                 X = X.reshape((X.shape[0], X.shape[1], 1))
-                model, history = build_and_train(X, y, epochs=epochs, batch_size=batch_size)
-                models[pollutant] = (model, scaler, series_t, n_steps)
+
+                # time-series split (no shuffling)
+                train_size = int(len(X) * 0.8)
+                if train_size < 1:
+                    st.write(f"跳過 {pollutant}：訓練資料不足")
+                    continue
+                X_train = X[:train_size]
+                y_train = y[:train_size]
+                X_val = X[train_size:]
+                y_val = y[train_size:]
+
+                # train model
+                model, history = build_and_train(X_train, y_train, epochs=epochs, batch_size=batch_size)
+
+                # evaluate (sklearn fallback expects flattened input)
+                X_train_flat = X_train.reshape((X_train.shape[0], X_train.shape[1]))
+                X_val_flat = X_val.reshape((X_val.shape[0], X_val.shape[1])) if len(X_val) > 0 else None
+
+                try:
+                    y_train_pred = model.predict(X_train_flat)
+                except Exception:
+                    y_train_pred = model.predict(X_train)
+                if X_val_flat is not None:
+                    try:
+                        y_val_pred = model.predict(X_val_flat)
+                    except Exception:
+                        y_val_pred = model.predict(X_val)
+                else:
+                    y_val_pred = None
+
+                # inverse transform to original scale
+                y_train_true = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+                y_train_pred_inv = scaler.inverse_transform(np.array(y_train_pred).reshape(-1, 1)).flatten()
+                if y_val_pred is not None:
+                    y_val_true = scaler.inverse_transform(y_val.reshape(-1, 1)).flatten()
+                    y_val_pred_inv = scaler.inverse_transform(np.array(y_val_pred).reshape(-1, 1)).flatten()
+                else:
+                    y_val_true = y_val_pred_inv = None
+
+                # compute metrics (use numpy sqrt for RMSE to be compatible with older sklearn)
+                train_mae = mean_absolute_error(y_train_true, y_train_pred_inv)
+                train_rmse = np.sqrt(mean_squared_error(y_train_true, y_train_pred_inv))
+                train_r2 = r2_score(y_train_true, y_train_pred_inv)
+                if y_val_pred is not None:
+                    val_mae = mean_absolute_error(y_val_true, y_val_pred_inv)
+                    val_rmse = np.sqrt(mean_squared_error(y_val_true, y_val_pred_inv))
+                    val_r2 = r2_score(y_val_true, y_val_pred_inv)
+                else:
+                    val_mae = val_rmse = val_r2 = None
+
+                # compute counts
+                train_count = len(y_train_true) if y_train_true is not None else 0
+                val_count = len(y_val_true) if y_val_true is not None else 0
+
+                # improved overfitting heuristic:
+                # - require a minimum number of validation samples (min_val_samples)
+                # - require validation RMSE to be meaningfully larger than train RMSE
+                min_val_samples = max(5, int(0.05 * (train_count + val_count)))
+                overfit_msg = "無法判斷驗證集（樣本太少）" if (val_rmse is None or val_count < min_val_samples) else None
+                if overfit_msg is None:
+                    # relative increase and an absolute delta threshold to avoid tiny noise triggering
+                    rel_increase = val_rmse / (train_rmse + 1e-12)
+                    abs_delta = val_rmse - train_rmse
+                    abs_threshold = max(1.0, 0.1 * train_rmse)  # require at least 1 unit or 10% increase
+                    if rel_increase > 1.2 and abs_delta > abs_threshold:
+                        overfit_msg = "可能過擬合"
+                    else:
+                        overfit_msg = "無明顯過擬合"
+
+                models[pollutant] = (model, scaler, series_t, n_steps, {
+                    'train_mae': train_mae,
+                    'train_rmse': train_rmse,
+                    'train_r2': train_r2,
+                    'val_mae': val_mae,
+                    'val_rmse': val_rmse,
+                    'val_r2': val_r2,
+                    'overfit_msg': overfit_msg
+                })
+
                 # save model to file for reuse (sklearn joblib .pkl)
                 joblib.dump(model, f"lstm_model({pollutant}).pkl")
                 st.write(f"{pollutant} 模型訓練完成（sklearn），已儲存 lstm_model({pollutant}).pkl")
+                # display metrics
+                st.write('訓練結果:')
+                st.write(f"Train MAE: {train_mae:.3f}, RMSE: {train_rmse:.3f}, R2: {train_r2:.3f}")
+                if val_rmse is not None:
+                    st.write(f"Val MAE: {val_mae:.3f}, RMSE: {val_rmse:.3f}, R2: {val_r2:.3f}")
+                st.write(f"過擬合判斷: {overfit_msg}")
+                # 顯示訓練/驗證樣本數，並提醒使用 8:2 切分
+                st.write(f"樣本數 — Train: {train_count}，Val: {val_count}（預設 8:2 切分）")
 
     if predict_btn:
         # try to load any pre-trained models saved in run
@@ -306,37 +428,58 @@ def app():
             if len(series_t) < n_steps + 1:
                 st.write(f"跳過 {pollutant}：資料不足")
                 continue
-            scaler = MinMaxScaler(feature_range=(0, 1))
-            scaled = scaler.fit_transform(series_t.values.reshape(-1, 1))
-            # prepare last window
-            last_window = scaled[-n_steps:]
-            X_last = last_window.reshape((1, n_steps, 1))
-
-            # if trained in this session, use it; otherwise try loading saved model
+            # Use scaler from in-session model if available, otherwise fit a new scaler
             if pollutant in models:
-                model = models[pollutant][0]
+                model, scaler, _, model_n_steps = models[pollutant]
+                # ensure n_steps matches
+                if model_n_steps != n_steps:
+                    st.warning(f"{pollutant} 模型的 look_back 與目前設定不一致，可能影響預測")
+                scaled = scaler.transform(series_t.values.reshape(-1, 1))
             else:
+                scaler = MinMaxScaler(feature_range=(0, 1))
+                scaled = scaler.fit_transform(series_t.values.reshape(-1, 1))
+                # try to load model from disk
                 try:
                     model = joblib.load(model_file)
                 except Exception:
                     st.write(f"{pollutant} 無可用模型 (請先訓練或上傳模型檔案)")
                     continue
 
-            # sklearn model expects flattened input
+            # prepare last window and predict next hour
+            last_window = scaled[-n_steps:]
+            X_last = last_window.reshape((1, n_steps, 1))
             X_last_flat = X_last.reshape((1, n_steps))
-            pred_scaled = model.predict(X_last_flat)
-            # pred_scaled is on scaled space because we trained on scaled values
+
+            try:
+                pred_scaled = model.predict(X_last_flat)
+            except Exception:
+                # fallback if model expects different input shape
+                pred_scaled = model.predict(X_last)
+
+            # inverse transform predicted value
             pred = scaler.inverse_transform(np.array(pred_scaled).reshape(-1, 1))[0][0]
             current = series_t.iloc[-1]
             time_last = series_t.index[-1]
+
+            # predict time: next hour
+            try:
+                pred_time = pd.to_datetime(time_last) + pd.Timedelta(hours=1)
+            except Exception:
+                pred_time = time_last
+
             predictions[pollutant] = (time_last, current, pred)
 
             st.subheader(f"{pollutant} 預測")
-            st.write(f"最新時間: {time_last}  當前數值: {current:.2f}  預測下一值: {pred:.2f}")
-            # plot: show last 100 points vs predicted last point appended
-            real_plot = series_t[-100:]
-            pred_plot = np.concatenate([real_plot.values, [pred]])
-            plot_series(real_plot.index.union(pd.Index([time_last])), pred_plot, pollutant)
+            st.write(f"最新時間: {time_last}  當前數值: {current:.2f}")
+            st.write(f"預測下一小時: {pred:.2f} (時間: {pred_time})")
+            try:
+                st.write(f"預測日期: {pd.to_datetime(pred_time).strftime('%Y-%m-%d')}  預測小時: {pd.to_datetime(pred_time).strftime('%H:%M')}")
+            except Exception:
+                st.write(f"預測時間: {pred_time}")
+            # plot: show last 100 hourly points (including possible NaNs) and predicted next-hour point
+            series_full = transform_data(series, aqi_t)  # do not dropna here to show hourly points
+            real_plot = series_full[-100:]
+            plot_series(real_plot, (pred_time, pred), pollutant)
 
         # AQI aggregation similar to notebook: choose pollutant with max AQI
         if predictions:
