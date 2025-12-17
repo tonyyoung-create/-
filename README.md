@@ -30,3 +30,12 @@
 - 若 CSV 欄位名稱與程式預期不同，請在 CSV 中確認時間欄位、污染物欄位名稱與數值欄位（monitordate、itemengname、concentration）對應。
 
 如需我幫你微調 UI 或增加更多監控/排程功能，我可以繼續修改。
+
+## 最近更新 (2025-12-17)
+
+- 修正與較舊 scikit-learn 相容性的 RMSE 計算（改為使用 numpy.sqrt(mean_squared_error(...))）。
+- 改進過擬合判斷邏輯：加入最小驗證樣本數檢查，並要求同時滿足相對與絕對 RMSE 增幅門檻才標示為「可能過擬合」。
+- 修正圖表繪製（每小時資料點顯示、下一小時預測以單一點顯示），以及時間索引向下取整至小時。
+- 加入 chat_history.md 並更新為最新摘要；已將修改推送至 GitHub（repo: https://github.com/tonyyoung-create/-）。
+
+請參考 `chat_history.md` 取得詳細的修改紀錄與排除錯誤說明。

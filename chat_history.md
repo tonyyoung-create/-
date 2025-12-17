@@ -47,3 +47,11 @@
 ---
 
 最後更新時間: 2025-12-17
+
+變更紀錄：
+
+- 2025-12-17: 修正 RMSE 計算以支援舊版 scikit-learn，並改進過擬合判斷邏輯。
+- 2025-12-17: 正規化 `plot_series` 函式縮排並修正 IndentationError。
+- 2025-12-17: 已將最新修改 commit 並 push 到 GitHub 儲存庫 https://github.com/tonyyoung-create/-.git
+
+若需完整逐條逐句的對話紀錄（非摘要），請回覆「要完整紀錄」，我會產生一個含完整訊息的檔案。
